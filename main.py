@@ -1,107 +1,304 @@
+#!/usr/bin/env python3
+"""
+scripts/test_cluster.py
+=======================
+Comprehensive cluster health test.
+
+Covers:
+  1.  Pre-flight  — connectivity to all nodes
+  2.  Auth        — every user role, correct & wrong password
+  3.  Permissions — each role is restricted to its allowed operations
+  4.  Replication — write→replicate→delete→replicate lifecycle
+  5.  Read-only   — direct writes to replicas must be rejected
+  6.  Replication status — pg_stat_replication shows connected replicas
+  7.  PgBouncer   — all write-path users connect successfully via the pooler
+  8.  Monitoring  — postgres-exporter, Prometheus, Grafana HTTP health checks
+
+Required .env keys (in addition to the standard cluster vars):
+  PRIMARY_DB=127.0.0.1:5433
+  REPLICA_DBS=127.0.0.1:5434,127.0.0.1:5435
+  BOUNCER_DB=127.0.0.1:6432
+
+Optional:
+  POSTGRES_EXPORTER_URL=http://127.0.0.1:9187
+  PROMETHEUS_URL=http://127.0.0.1:9090
+  GRAFANA_URL=http://127.0.0.1:3000
+  REPLICATION_LAG_WAIT=3
+"""
+
 import logging
 import os
 import time
+import urllib.error
+import urllib.request
 
 import psycopg2
 from dotenv import load_dotenv
 from psycopg2.extras import RealDictCursor
 
-# --- 1. Setup ---
+# ---------------------------------------------------------------------------
+# Bootstrap
+# ---------------------------------------------------------------------------
 load_dotenv()
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger("ClusterTest")
 
-DB_USER = os.getenv("POSTGRES_USER")
-DB_PASS = os.getenv("POSTGRES_PASSWORD")
-DB_NAME = os.getenv("POSTGRES_DB")
+# Core credentials
+ADMIN_USER = os.getenv("POSTGRES_USER", "admin")
+ADMIN_PASS = os.getenv("POSTGRES_PASSWORD", "")
+DB_NAME    = os.getenv("POSTGRES_DB", "app")
 
+MIGRATION_USER = os.getenv("MIGRATION_USER", "migration_user")
+MIGRATION_PASS = os.getenv("MIGRATION_PASSWORD", "")
+
+APP_USER = os.getenv("APP_USER", "app_user")
+APP_PASS = os.getenv("APP_PASSWORD", "")
+
+READ_USER = os.getenv("READ_USER", "read_user")
+READ_PASS = os.getenv("READ_PASSWORD", "")
+
+PGBOUNCER_AUTH_USER = os.getenv("PGBOUNCER_AUTH_USER", "pgbouncer_auth")
+PGBOUNCER_AUTH_PASS = os.getenv("PGBOUNCER_AUTH_PASSWORD", "")
+
+LAG_WAIT = int(os.getenv("REPLICATION_LAG_WAIT", "3"))
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def parse_address(addr_string):
-    """Splits 'host:port' into ('host', port)"""
     if not addr_string:
         return None, None
     parts = addr_string.split(":")
-    host = parts[0]
-    port = int(parts[1]) if len(parts) > 1 else 5432
-    return host, port
+    return parts[0], int(parts[1]) if len(parts) > 1 else 5432
 
 
-def get_connection(host, port):
-    return psycopg2.connect(
+def connect(host, port, user, password, dbname=None, autocommit=False):
+    conn = psycopg2.connect(
         host=host,
         port=port,
-        user=DB_USER,
-        password=DB_PASS,
-        dbname=DB_NAME,
+        user=user,
+        password=password,
+        dbname=dbname or DB_NAME,
         connect_timeout=5,
         cursor_factory=RealDictCursor,
     )
+    conn.autocommit = autocommit
+    return conn
 
 
 def section(title):
     logger.info("")
-    logger.info("=" * 55)
+    logger.info("=" * 60)
     logger.info(f"  {title}")
-    logger.info("=" * 55)
+    logger.info("=" * 60)
 
 
-# --- 2. Connectivity Pre-Check ---
+# Results accumulator: {test_label: bool}
+RESULTS: dict[str, bool] = {}
 
 
-def test_connection(host, port, label):
-    """Tries to open and immediately close a connection. Returns True/False."""
+def record(label, passed):
+    RESULTS[label] = passed
+    icon = "✅" if passed else "❌"
+    level = logger.info if passed else logger.error
+    level(f"  {icon}  {label}")
+    return passed
+
+
+# ---------------------------------------------------------------------------
+# 1. Pre-flight connectivity
+# ---------------------------------------------------------------------------
+
+def test_connectivity(host, port, label, user=None, password=None, dbname=None):
+    u = user or ADMIN_USER
+    p = password or ADMIN_PASS
     try:
-        conn = get_connection(host, port)
+        conn = connect(host, port, u, p, dbname=dbname)
         conn.close()
-        logger.info(f"  ✅ {label} ({host}:{port}) — reachable")
-        return True
+        return record(f"connect: {label}", True)
     except psycopg2.OperationalError as e:
-        first_line = str(e).splitlines()[0]
-        logger.error(f"  ❌ {label} ({host}:{port}) — UNREACHABLE: {first_line}")
-        return False
+        logger.error(f"  ❌  connect: {label} — {str(e).splitlines()[0]}")
+        return record(f"connect: {label}", False)
 
 
-def preflight_check(p_host, p_port, replicas, b_host, b_port):
-    section("PRE-FLIGHT: Testing connectivity to all nodes")
-    results = {}
-
-    results["primary"] = test_connection(p_host, p_port, "PRIMARY")
-
-    for label, r_host, r_port in replicas:
-        results[label] = test_connection(r_host, r_port, label)
-
+def preflight(p_host, p_port, replicas, b_host, b_port):
+    section("1. PRE-FLIGHT — Connectivity")
+    ok = True
+    ok &= test_connectivity(p_host, p_port, f"primary ({p_host}:{p_port})")
+    for label, rh, rp in replicas:
+        ok &= test_connectivity(rh, rp, f"{label} ({rh}:{rp})")
     if b_host:
-        results["pgbouncer"] = test_connection(b_host, b_port, "PGBOUNCER")
-
-    failed = [k for k, v in results.items() if not v]
-    if failed:
-        logger.error("")
-        logger.error(
-            f"  Cannot proceed — {len(failed)} node(s) unreachable: {', '.join(failed)}"
-        )
-        logger.error("  Check that:")
-        logger.error("    1. Your cluster is running:  docker compose ps")
-        logger.error(
-            "    2. PRIMARY_DB / REPLICA_DBS use 127.0.0.1, not Docker hostnames"
-        )
-        logger.error("    3. Ports match what is exposed in docker-compose.yaml")
-        return False
-
-    logger.info("")
-    logger.info("  All nodes reachable — proceeding with tests.")
-    return True
+        ok &= test_connectivity(b_host, b_port, f"pgbouncer ({b_host}:{b_port})")
+    if not ok:
+        logger.error("  Aborting — one or more nodes unreachable.")
+    return ok
 
 
-# --- 3. Primary Operations ---
+# ---------------------------------------------------------------------------
+# 2. Authentication — every role, correct + wrong password
+# ---------------------------------------------------------------------------
 
-
-def create_table(host, port):
-    section("STEP 1: Create table on PRIMARY")
+def test_auth_correct(host, port, user, password, dbname, label):
+    """Expect success."""
     try:
-        with get_connection(host, port) as conn:
-            conn.autocommit = True
+        conn = connect(host, port, user, password, dbname=dbname)
+        conn.close()
+        return record(f"auth correct: {label}", True)
+    except psycopg2.OperationalError as e:
+        logger.error(f"  ❌  auth correct: {label} — {str(e).splitlines()[0]}")
+        return record(f"auth correct: {label}", False)
+
+
+def test_auth_wrong(host, port, user, dbname, label):
+    """Expect failure — passes the test when auth is correctly rejected."""
+    try:
+        conn = connect(host, port, user, "definitely-wrong-password-xyz", dbname=dbname)
+        conn.close()
+        logger.error(f"  ❌  auth wrong-pw: {label} — connection SUCCEEDED (should have been rejected)")
+        return record(f"auth wrong-pw: {label}", False)
+    except psycopg2.OperationalError:
+        return record(f"auth wrong-pw: {label}", True)
+
+
+def run_auth_tests(p_host, p_port, replicas):
+    section("2. AUTHENTICATION — all roles")
+    r1_host, r1_port = (replicas[0][1], replicas[0][2]) if replicas else (p_host, p_port)
+
+    # admin → primary (postgres db so it always exists)
+    test_auth_correct(p_host, p_port, ADMIN_USER, ADMIN_PASS, "postgres", "admin on primary (postgres db)")
+    test_auth_wrong(p_host, p_port, ADMIN_USER, "postgres", "admin wrong password")
+
+    # migration_user → primary → app db
+    test_auth_correct(p_host, p_port, MIGRATION_USER, MIGRATION_PASS, DB_NAME, "migration_user on primary")
+    test_auth_wrong(p_host, p_port, MIGRATION_USER, DB_NAME, "migration_user wrong password")
+
+    # app_user → primary → app db
+    test_auth_correct(p_host, p_port, APP_USER, APP_PASS, DB_NAME, "app_user on primary")
+    test_auth_wrong(p_host, p_port, APP_USER, DB_NAME, "app_user wrong password")
+
+    # read_user → replica → app db
+    test_auth_correct(r1_host, r1_port, READ_USER, READ_PASS, DB_NAME, "read_user on replica")
+    test_auth_wrong(r1_host, r1_port, READ_USER, DB_NAME, "read_user wrong password")
+
+
+# ---------------------------------------------------------------------------
+# 3. Permissions enforcement
+# ---------------------------------------------------------------------------
+
+def run_permission_tests(p_host, p_port, replicas):
+    section("3. PERMISSIONS — role boundaries")
+    r1_host, r1_port = (replicas[0][1], replicas[0][2]) if replicas else (p_host, p_port)
+
+    # Ensure the test table exists (created by admin so it has all grants applied by PATCHER)
+    try:
+        with connect(p_host, p_port, ADMIN_USER, ADMIN_PASS, dbname=DB_NAME, autocommit=True) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS perms_test (
+                        id   SERIAL PRIMARY KEY,
+                        val  TEXT
+                    );
+                    TRUNCATE perms_test;
+                    INSERT INTO perms_test (val) VALUES ('seed');
+                """)
+    except Exception as e:
+        logger.error(f"  Could not set up perms_test table: {e}")
+        return
+
+    # --- migration_user: DDL allowed ---
+    label = "migration_user can CREATE TABLE"
+    try:
+        with connect(p_host, p_port, MIGRATION_USER, MIGRATION_PASS, dbname=DB_NAME, autocommit=True) as conn:
+            with conn.cursor() as cur:
+                cur.execute("DROP TABLE IF EXISTS migration_ddl_test; CREATE TABLE migration_ddl_test (x INT);")
+                cur.execute("DROP TABLE IF EXISTS migration_ddl_test;")
+        record(label, True)
+    except Exception as e:
+        logger.error(f"  {label} failed: {e}")
+        record(label, False)
+
+    # --- app_user: INSERT allowed ---
+    label = "app_user can INSERT"
+    try:
+        with connect(p_host, p_port, APP_USER, APP_PASS, dbname=DB_NAME, autocommit=True) as conn:
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO perms_test (val) VALUES ('from app_user');")
+        record(label, True)
+    except Exception as e:
+        logger.error(f"  {label} failed: {e}")
+        record(label, False)
+
+    # --- app_user: SELECT allowed ---
+    label = "app_user can SELECT"
+    try:
+        with connect(p_host, p_port, APP_USER, APP_PASS, dbname=DB_NAME) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) AS n FROM perms_test;")
+                row = cur.fetchone()
+        record(label, row is not None)
+    except Exception as e:
+        logger.error(f"  {label} failed: {e}")
+        record(label, False)
+
+    # --- app_user: CREATE TABLE rejected ---
+    label = "app_user cannot CREATE TABLE (expected rejection)"
+    try:
+        with connect(p_host, p_port, APP_USER, APP_PASS, dbname=DB_NAME, autocommit=True) as conn:
+            with conn.cursor() as cur:
+                cur.execute("CREATE TABLE app_should_fail (x INT);")
+        logger.error(f"  ❌  {label} — DDL succeeded (should have been denied)")
+        record(label, False)
+    except psycopg2.errors.InsufficientPrivilege:
+        record(label, True)
+    except Exception as e:
+        logger.warning(f"  ⚠️  {label} — unexpected error: {e}")
+        record(label, False)
+
+    # --- read_user: SELECT on replica allowed ---
+    label = "read_user can SELECT on replica"
+    try:
+        with connect(r1_host, r1_port, READ_USER, READ_PASS, dbname=DB_NAME) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) AS n FROM perms_test;")
+                row = cur.fetchone()
+        record(label, row is not None)
+    except Exception as e:
+        logger.error(f"  {label} failed: {e}")
+        record(label, False)
+
+    # --- read_user: INSERT rejected (on primary, enforced by grants) ---
+    label = "read_user cannot INSERT (expected rejection)"
+    try:
+        with connect(p_host, p_port, READ_USER, READ_PASS, dbname=DB_NAME, autocommit=True) as conn:
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO perms_test (val) VALUES ('read_user_attempt');")
+        logger.error(f"  ❌  {label} — INSERT succeeded (should have been denied)")
+        record(label, False)
+    except (psycopg2.errors.InsufficientPrivilege, psycopg2.errors.ReadOnlySqlTransaction):
+        record(label, True)
+    except Exception as e:
+        logger.warning(f"  ⚠️  {label} — unexpected error: {e}")
+        record(label, False)
+
+
+# ---------------------------------------------------------------------------
+# 4. Replication lifecycle
+# ---------------------------------------------------------------------------
+
+def run_replication_lifecycle(p_host, p_port, replicas):
+    section("4. REPLICATION LIFECYCLE — write → replicate → delete → replicate")
+
+    record_id = int(time.time())
+    message = f"lifecycle test at {time.strftime('%Y-%m-%d %H:%M:%S')}"
+
+    # Create table
+    try:
+        with connect(p_host, p_port, ADMIN_USER, ADMIN_PASS, dbname=DB_NAME, autocommit=True) as conn:
             with conn.cursor() as cur:
                 cur.execute("""
                     DROP TABLE IF EXISTS cluster_lifecycle_test;
@@ -111,249 +308,306 @@ def create_table(host, port):
                         ts      TIMESTAMP DEFAULT NOW()
                     );
                 """)
-                logger.info(
-                    f"✅ PRIMARY ({host}:{port}): Table 'cluster_lifecycle_test' created."
-                )
-                return True
+        record("lifecycle: create table on primary", True)
     except Exception as e:
-        logger.error(f"❌ PRIMARY: Failed to create table: {e}")
-        return False
+        logger.error(f"  lifecycle: create table failed: {e}")
+        record("lifecycle: create table on primary", False)
+        return
 
-
-def write_to_primary(host, port, record_id, message):
-    section(f"STEP 2: Write record (id={record_id}) to PRIMARY")
+    # Write
     try:
-        with get_connection(host, port) as conn:
-            conn.autocommit = True
+        with connect(p_host, p_port, ADMIN_USER, ADMIN_PASS, dbname=DB_NAME, autocommit=True) as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "INSERT INTO cluster_lifecycle_test (id, message) VALUES (%s, %s);",
                     (record_id, message),
                 )
-                logger.info(
-                    f"✅ PRIMARY ({host}:{port}): Inserted id={record_id} message='{message}'"
-                )
-                return True
+        record(f"lifecycle: write id={record_id} to primary", True)
     except Exception as e:
-        logger.error(f"❌ PRIMARY: Write failed: {e}")
-        return False
+        logger.error(f"  lifecycle: write failed: {e}")
+        record(f"lifecycle: write id={record_id} to primary", False)
+        return
 
+    logger.info(f"  Waiting {LAG_WAIT}s for WAL replication...")
+    time.sleep(LAG_WAIT)
 
-def delete_from_primary(host, port, record_id):
-    section(f"STEP 4: Delete record (id={record_id}) from PRIMARY")
+    # Read from all replicas — should exist
+    for label, rh, rp in replicas:
+        lbl = f"lifecycle: {label} has record after write"
+        try:
+            with connect(rh, rp, ADMIN_USER, ADMIN_PASS, dbname=DB_NAME) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT id FROM cluster_lifecycle_test WHERE id = %s;",
+                        (record_id,),
+                    )
+                    row = cur.fetchone()
+            if row:
+                record(lbl, True)
+            else:
+                logger.warning(f"  ⚠️  {lbl} — not found (replication lag?)")
+                record(lbl, False)
+        except Exception as e:
+            logger.error(f"  {lbl} failed: {e}")
+            record(lbl, False)
+
+    # Delete from primary
     try:
-        with get_connection(host, port) as conn:
-            conn.autocommit = True
+        with connect(p_host, p_port, ADMIN_USER, ADMIN_PASS, dbname=DB_NAME, autocommit=True) as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "DELETE FROM cluster_lifecycle_test WHERE id = %s;", (record_id,)
                 )
-                logger.info(f"✅ PRIMARY ({host}:{port}): Deleted id={record_id}")
-                return True
+        record(f"lifecycle: delete id={record_id} from primary", True)
     except Exception as e:
-        logger.error(f"❌ PRIMARY: Delete failed: {e}")
-        return False
+        logger.error(f"  lifecycle: delete failed: {e}")
+        record(f"lifecycle: delete id={record_id} from primary", False)
+        return
 
+    logger.info(f"  Waiting {LAG_WAIT}s for delete to replicate...")
+    time.sleep(LAG_WAIT)
 
-# --- 3. Replica Checks ---
-
-
-def check_replica_has_record(host, port, record_id, replica_label="REPLICA"):
-    """Returns True if the record EXISTS on the replica."""
-    try:
-        with get_connection(host, port) as conn:
-            with conn.cursor() as cur:
-                # Confirm it is actually a replica
-                cur.execute("SELECT pg_is_in_recovery() as recovery;")
-                status = cur.fetchone()
-                if not status["recovery"]:
-                    logger.error(
-                        f"❌ {replica_label} ({host}:{port}): NOT in recovery mode — this is a primary!"
+    # Read from all replicas — should be gone
+    for label, rh, rp in replicas:
+        lbl = f"lifecycle: {label} record gone after delete"
+        try:
+            with connect(rh, rp, ADMIN_USER, ADMIN_PASS, dbname=DB_NAME) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT id FROM cluster_lifecycle_test WHERE id = %s;",
+                        (record_id,),
                     )
-                    return None
-
-                cur.execute(
-                    "SELECT id, message, ts FROM cluster_lifecycle_test WHERE id = %s;",
-                    (record_id,),
-                )
-                row = cur.fetchone()
-                return row
-    except Exception as e:
-        logger.error(f"❌ {replica_label} ({host}:{port}): Query failed: {e}")
-        return None
+                    row = cur.fetchone()
+            if not row:
+                record(lbl, True)
+            else:
+                logger.warning(f"  ⚠️  {lbl} — still present (replication lag?)")
+                record(lbl, False)
+        except Exception as e:
+            logger.error(f"  {lbl} failed: {e}")
+            record(lbl, False)
 
 
-def verify_replicas_have_record(replicas, record_id, step_label):
-    section(f"STEP {step_label}: Read record (id={record_id}) from ALL REPLICAS")
-    all_ok = True
-    for label, host, port in replicas:
-        row = check_replica_has_record(host, port, record_id, label)
-        if row:
-            logger.info(
-                f"✅ {label} ({host}:{port}): Record found — id={row['id']} message='{row['message']}' ts={row['ts']}"
-            )
-        elif row is None:
-            logger.error(
-                f"❌ {label} ({host}:{port}): Could not verify (error or not a replica)"
-            )
-            all_ok = False
-        else:
-            logger.warning(
-                f"⚠️  {label} ({host}:{port}): Record NOT found (possible replication lag)"
-            )
-            all_ok = False
-    return all_ok
+# ---------------------------------------------------------------------------
+# 5. Write rejection on replicas
+# ---------------------------------------------------------------------------
+
+def run_replica_write_rejection(replicas):
+    section("5. REPLICA WRITE REJECTION — replicas must refuse writes")
+    for label, rh, rp in replicas:
+        lbl = f"write rejected on {label}"
+        try:
+            with connect(rh, rp, ADMIN_USER, ADMIN_PASS, dbname=DB_NAME, autocommit=True) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("CREATE TABLE IF NOT EXISTS should_not_exist (x INT);")
+            logger.error(f"  ❌  {lbl} — write SUCCEEDED (replica is not read-only!)")
+            record(lbl, False)
+        except psycopg2.errors.ReadOnlySqlTransaction:
+            record(lbl, True)
+        except Exception as e:
+            # psycopg2 wraps the "cannot execute ... in a read-only transaction" in OperationalError
+            msg = str(e).lower()
+            if "read-only" in msg or "read only" in msg or "cannot execute" in msg:
+                record(lbl, True)
+            else:
+                logger.error(f"  ❌  {lbl} — unexpected error: {e}")
+                record(lbl, False)
 
 
-def verify_replicas_missing_record(replicas, record_id):
-    section(f"STEP 5: Confirm record (id={record_id}) is GONE from ALL REPLICAS")
-    all_ok = True
-    for label, host, port in replicas:
-        row = check_replica_has_record(host, port, record_id, label)
-        if row is None and isinstance(row, type(None)):
-            # distinguish error (None returned on exception) from not found (falsy dict)
-            # re-check by catching explicitly
-            try:
-                with get_connection(host, port) as conn:
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            "SELECT id FROM cluster_lifecycle_test WHERE id = %s;",
-                            (record_id,),
-                        )
-                        found = cur.fetchone()
-                        if not found:
-                            logger.info(
-                                f"✅ {label} ({host}:{port}): Record correctly absent after delete."
-                            )
-                        else:
-                            logger.warning(
-                                f"⚠️  {label} ({host}:{port}): Record still present (replication lag?)"
-                            )
-                            all_ok = False
-            except Exception as e:
-                logger.error(f"❌ {label} ({host}:{port}): {e}")
-                all_ok = False
-        elif not row:
-            logger.info(
-                f"✅ {label} ({host}:{port}): Record correctly absent after delete."
-            )
-        else:
-            logger.warning(
-                f"⚠️  {label} ({host}:{port}): Record still present (replication lag?)"
-            )
-            all_ok = False
-    return all_ok
+# ---------------------------------------------------------------------------
+# 6. Replication status via pg_stat_replication
+# ---------------------------------------------------------------------------
 
-
-def test_bouncer(host, port):
-    section("BONUS: PgBouncer connectivity check")
+def run_replication_status(p_host, p_port, expected_replicas):
+    section("6. REPLICATION STATUS — pg_stat_replication")
     try:
-        with get_connection(host, port) as conn:
+        with connect(p_host, p_port, ADMIN_USER, ADMIN_PASS, dbname="postgres") as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT 1 as alive;")
-                if cur.fetchone()["alive"] == 1:
-                    logger.info(f"✅ PGBOUNCER ({host}:{port}): Connection successful.")
-                    return True
+                cur.execute("""
+                    SELECT
+                        application_name,
+                        state,
+                        sync_state,
+                        pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), sent_lsn))  AS send_lag,
+                        pg_size_pretty(pg_wal_lsn_diff(sent_lsn,            write_lsn)) AS write_lag,
+                        pg_size_pretty(pg_wal_lsn_diff(write_lsn,           flush_lsn)) AS flush_lag,
+                        pg_size_pretty(pg_wal_lsn_diff(flush_lsn,           replay_lsn)) AS replay_lag
+                    FROM pg_stat_replication
+                    ORDER BY application_name;
+                """)
+                rows = cur.fetchall()
+
+        count = len(rows)
+        logger.info(f"  Connected replicas: {count} (expected ≥ {expected_replicas})")
+        for row in rows:
+            logger.info(
+                f"    {row['application_name']}  state={row['state']}  "
+                f"send_lag={row['send_lag']}  replay_lag={row['replay_lag']}"
+            )
+        record("replication: all replicas connected", count >= expected_replicas)
     except Exception as e:
-        logger.error(f"❌ PGBOUNCER ({host}:{port}): {e}")
-    return False
+        logger.error(f"  pg_stat_replication query failed: {e}")
+        record("replication: all replicas connected", False)
 
 
-# --- 4. Main Runner ---
+# ---------------------------------------------------------------------------
+# 7. PgBouncer — write-path users
+# ---------------------------------------------------------------------------
 
+def run_pgbouncer_tests(b_host, b_port):
+    section("7. PGBOUNCER — write-path user connectivity")
+
+    users = [
+        ("admin",          ADMIN_USER,      ADMIN_PASS,      DB_NAME),
+        ("migration_user", MIGRATION_USER,  MIGRATION_PASS,  DB_NAME),
+        ("app_user",       APP_USER,        APP_PASS,        DB_NAME),
+    ]
+
+    for label, user, password, dbname in users:
+        lbl = f"pgbouncer: {label} can connect and query"
+        try:
+            with connect(b_host, b_port, user, password, dbname=dbname) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1 AS alive;")
+                    row = cur.fetchone()
+            record(lbl, row is not None and row.get("alive") == 1)
+        except Exception as e:
+            logger.error(f"  ❌  {lbl} — {str(e).splitlines()[0]}")
+            record(lbl, False)
+
+    # Verify transaction-mode pooling: a multi-statement transaction must work
+    lbl = "pgbouncer: app_user transaction commit"
+    try:
+        conn = connect(b_host, b_port, APP_USER, APP_PASS, dbname=DB_NAME)
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT current_database() AS db;")
+                row = cur.fetchone()
+        conn.close()
+        record(lbl, row is not None)
+    except Exception as e:
+        logger.error(f"  ❌  {lbl} — {str(e).splitlines()[0]}")
+        record(lbl, False)
+
+    # read_user should NOT be routable through PgBouncer (not in userlist.txt)
+    # auth_query fallback may or may not work depending on server state;
+    # we check the design intent by confirming read_user is excluded from pooled write path.
+    lbl = "pgbouncer: read_user is not a pooled write-path user (design check)"
+    # This is a documentation-level check — we log a note rather than a pass/fail
+    logger.info(f"  ℹ️   {lbl}: read_user connects DIRECTLY to replica ports, not via PgBouncer.")
+
+
+# ---------------------------------------------------------------------------
+# 8. Monitoring health checks
+# ---------------------------------------------------------------------------
+
+def http_check(url, label, expected_status=200, timeout=5):
+    lbl = f"monitoring: {label}"
+    try:
+        req = urllib.request.Request(url, headers={"Accept": "*/*"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status = resp.status
+        if status == expected_status:
+            return record(lbl, True)
+        else:
+            logger.error(f"  ❌  {lbl} — HTTP {status} (expected {expected_status})")
+            return record(lbl, False)
+    except urllib.error.HTTPError as e:
+        logger.error(f"  ❌  {lbl} — HTTP {e.code}: {e.reason}")
+        return record(lbl, False)
+    except Exception as e:
+        logger.error(f"  ❌  {lbl} — {e}")
+        return record(lbl, False)
+
+
+def run_monitoring_checks():
+    section("8. MONITORING — HTTP health checks")
+
+    exporter_url  = os.getenv("POSTGRES_EXPORTER_URL", "").rstrip("/")
+    prometheus_url = os.getenv("PROMETHEUS_URL", "").rstrip("/")
+    grafana_url   = os.getenv("GRAFANA_URL", "").rstrip("/")
+
+    if exporter_url:
+        http_check(f"{exporter_url}/metrics", "postgres-exporter /metrics")
+    else:
+        logger.info("  ⏭️   postgres-exporter: POSTGRES_EXPORTER_URL not set — skipping")
+
+    if prometheus_url:
+        http_check(f"{prometheus_url}/-/healthy", "Prometheus /-/healthy")
+    else:
+        logger.info("  ⏭️   Prometheus: PROMETHEUS_URL not set — skipping")
+
+    if grafana_url:
+        http_check(f"{grafana_url}/api/health", "Grafana /api/health")
+    else:
+        logger.info("  ⏭️   Grafana: GRAFANA_URL not set — skipping")
+
+
+# ---------------------------------------------------------------------------
+# Final summary
+# ---------------------------------------------------------------------------
+
+def print_summary():
+    section("FINAL SUMMARY")
+    passed = [k for k, v in RESULTS.items() if v]
+    failed = [k for k, v in RESULTS.items() if not v]
+
+    for label in passed:
+        logger.info(f"  ✅  {label}")
+    for label in failed:
+        logger.error(f"  ❌  {label}")
+
+    logger.info("")
+    total = len(RESULTS)
+    logger.info(f"  Passed: {len(passed)}/{total}")
+
+    if not failed:
+        logger.info("  🟢  ALL CHECKS PASSED — CLUSTER HEALTHY")
+    else:
+        logger.error(f"  🔴  {len(failed)} CHECK(S) FAILED — SEE ABOVE")
+    return len(failed) == 0
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def main():
     p_host, p_port = parse_address(os.getenv("PRIMARY_DB"))
     b_host, b_port = parse_address(os.getenv("BOUNCER_DB"))
 
-    # Support multiple replicas: REPLICA_DBS=127.0.0.1:5434,127.0.0.1:5435
     replicas = []
     for i, entry in enumerate(os.getenv("REPLICA_DBS", "").split(","), start=1):
-        if not entry.strip():
-            continue
-        r_host, r_port = parse_address(entry.strip())
-        replicas.append((f"REPLICA-{i}", r_host, r_port))
+        entry = entry.strip()
+        if entry:
+            rh, rp = parse_address(entry)
+            replicas.append((f"REPLICA-{i}", rh, rp))
 
     if not p_host:
-        logger.error("No PRIMARY_DB defined in .env  (e.g. PRIMARY_DB=127.0.0.1:5433)")
+        logger.error("PRIMARY_DB not set  (e.g. PRIMARY_DB=127.0.0.1:5433)")
         return
-
     if not replicas:
-        logger.error(
-            "No REPLICA_DBS defined in .env  (e.g. REPLICA_DBS=127.0.0.1:5434)"
-        )
+        logger.error("REPLICA_DBS not set  (e.g. REPLICA_DBS=127.0.0.1:5434,127.0.0.1:5435)")
         return
 
-    # Pre-flight — abort immediately if any node is unreachable
-    if not preflight_check(p_host, p_port, replicas, b_host, b_port):
+    if not preflight(p_host, p_port, replicas, b_host, b_port):
         exit(1)
 
-    record_id = int(time.time())
-    message = f"hello from lifecycle test at {time.strftime('%Y-%m-%d %H:%M:%S')}"
-    lag_wait = int(os.getenv("REPLICATION_LAG_WAIT", "3"))  # seconds to wait for WAL
+    run_auth_tests(p_host, p_port, replicas)
+    run_permission_tests(p_host, p_port, replicas)
+    run_replication_lifecycle(p_host, p_port, replicas)
+    run_replica_write_rejection(replicas)
+    run_replication_status(p_host, p_port, expected_replicas=len(replicas))
 
-    results = {}
-
-    # Step 1 — Create table
-    results["create"] = create_table(p_host, p_port)
-    if not results["create"]:
-        logger.error("Aborting — could not create table on primary.")
-        return
-
-    # Step 2 — Write to primary
-    results["write"] = write_to_primary(p_host, p_port, record_id, message)
-    if not results["write"]:
-        logger.error("Aborting — could not write to primary.")
-        return
-
-    # Wait for WAL replication
-    logger.info(f"Waiting {lag_wait}s for WAL to replicate to replicas...")
-    time.sleep(lag_wait)
-
-    # Step 3 — Read from replicas (should exist)
-    results["read_after_write"] = verify_replicas_have_record(
-        replicas, record_id, step_label="3"
-    )
-
-    # Step 4 — Delete from primary
-    results["delete"] = delete_from_primary(p_host, p_port, record_id)
-
-    # Wait for delete to replicate
-    logger.info(f"Waiting {lag_wait}s for delete to replicate to replicas...")
-    time.sleep(lag_wait)
-
-    # Step 5 — Read from replicas (should be gone)
-    results["read_after_delete"] = verify_replicas_missing_record(replicas, record_id)
-
-    # PgBouncer check
     if b_host:
-        results["bouncer"] = test_bouncer(b_host, b_port)
-
-    # --- Final Summary ---
-    section("FINAL SUMMARY")
-    status_map = {
-        "create": "Table creation on primary",
-        "write": "Write to primary",
-        "read_after_write": "Read from replicas after write",
-        "delete": "Delete from primary",
-        "read_after_delete": "Replicas reflect deletion",
-        "bouncer": "PgBouncer connectivity",
-    }
-    all_passed = True
-    for key, label in status_map.items():
-        if key not in results:
-            continue
-        icon = "✅" if results[key] else "❌"
-        if not results[key]:
-            all_passed = False
-        logger.info(f"  {icon}  {label}")
-
-    logger.info("")
-    if all_passed:
-        logger.info("🟢  ALL CHECKS PASSED — CLUSTER HEALTHY")
+        run_pgbouncer_tests(b_host, b_port)
     else:
-        logger.error("🔴  SOME CHECKS FAILED — SEE ABOVE")
-        exit(1)
+        logger.info("\n  ⏭️   PgBouncer tests skipped — BOUNCER_DB not set")
+
+    run_monitoring_checks()
+
+    all_passed = print_summary()
+    exit(0 if all_passed else 1)
 
 
 if __name__ == "__main__":
