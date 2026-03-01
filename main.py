@@ -15,9 +15,16 @@ Covers:
   8.  Monitoring  — postgres-exporter, Prometheus, Grafana HTTP health checks
 
 Required .env keys (in addition to the standard cluster vars):
-  PRIMARY_DB=127.0.0.1:5433
-  REPLICA_DBS=127.0.0.1:5434,127.0.0.1:5435
-  BOUNCER_DB=127.0.0.1:6432
+  PRIMARY_DB=pgbouncer:5432          # or 127.0.0.1:6432 from outside Docker
+  DIRECT_PRIMARY_DB=postgres-primary:5432  # direct to PostgreSQL, bypasses PgBouncer
+  REPLICA_DBS=postgres-replica-1:5432,postgres-replica-2:5432
+  BOUNCER_DB=pgbouncer:5432          # same as PRIMARY_DB when running inside Docker
+
+Notes:
+  PRIMARY_DB     — used for app-level tests (routes through PgBouncer when inside Docker)
+  DIRECT_PRIMARY_DB — used for pg_stat_replication and read_user permission tests that
+                      require a direct PostgreSQL connection bypassing PgBouncer.
+                      Falls back to PRIMARY_DB if not set.
 
 Optional:
   POSTGRES_EXPORTER_URL=http://127.0.0.1:9187
@@ -169,9 +176,9 @@ def run_auth_tests(p_host, p_port, replicas):
     section("2. AUTHENTICATION — all roles")
     r1_host, r1_port = (replicas[0][1], replicas[0][2]) if replicas else (p_host, p_port)
 
-    # admin → primary (postgres db so it always exists)
-    test_auth_correct(p_host, p_port, ADMIN_USER, ADMIN_PASS, "postgres", "admin on primary (postgres db)")
-    test_auth_wrong(p_host, p_port, ADMIN_USER, "postgres", "admin wrong password")
+    # admin → primary via app db (PgBouncer may not expose the postgres system db directly)
+    test_auth_correct(p_host, p_port, ADMIN_USER, ADMIN_PASS, DB_NAME, "admin on primary")
+    test_auth_wrong(p_host, p_port, ADMIN_USER, DB_NAME, "admin wrong password")
 
     # migration_user → primary → app db
     test_auth_correct(p_host, p_port, MIGRATION_USER, MIGRATION_PASS, DB_NAME, "migration_user on primary")
@@ -190,7 +197,7 @@ def run_auth_tests(p_host, p_port, replicas):
 # 3. Permissions enforcement
 # ---------------------------------------------------------------------------
 
-def run_permission_tests(p_host, p_port, replicas):
+def run_permission_tests(p_host, p_port, direct_host, direct_port, replicas):
     section("3. PERMISSIONS — role boundaries")
     r1_host, r1_port = (replicas[0][1], replicas[0][2]) if replicas else (p_host, p_port)
 
@@ -271,10 +278,10 @@ def run_permission_tests(p_host, p_port, replicas):
         logger.error(f"  {label} failed: {e}")
         record(label, False)
 
-    # --- read_user: INSERT rejected (on primary, enforced by grants) ---
+    # --- read_user: INSERT rejected — connect DIRECTLY to primary (read_user not in PgBouncer userlist) ---
     label = "read_user cannot INSERT (expected rejection)"
     try:
-        with connect(p_host, p_port, READ_USER, READ_PASS, dbname=DB_NAME, autocommit=True) as conn:
+        with connect(direct_host, direct_port, READ_USER, READ_PASS, dbname=DB_NAME, autocommit=True) as conn:
             with conn.cursor() as cur:
                 cur.execute("INSERT INTO perms_test (val) VALUES ('read_user_attempt');")
         logger.error(f"  ❌  {label} — INSERT succeeded (should have been denied)")
@@ -405,7 +412,6 @@ def run_replica_write_rejection(replicas):
         except psycopg2.errors.ReadOnlySqlTransaction:
             record(lbl, True)
         except Exception as e:
-            # psycopg2 wraps the "cannot execute ... in a read-only transaction" in OperationalError
             msg = str(e).lower()
             if "read-only" in msg or "read only" in msg or "cannot execute" in msg:
                 record(lbl, True)
@@ -418,10 +424,10 @@ def run_replica_write_rejection(replicas):
 # 6. Replication status via pg_stat_replication
 # ---------------------------------------------------------------------------
 
-def run_replication_status(p_host, p_port, expected_replicas):
+def run_replication_status(direct_host, direct_port, expected_replicas):
     section("6. REPLICATION STATUS — pg_stat_replication")
     try:
-        with connect(p_host, p_port, ADMIN_USER, ADMIN_PASS, dbname="postgres") as conn:
+        with connect(direct_host, direct_port, ADMIN_USER, ADMIN_PASS, dbname=DB_NAME) as conn:
             with conn.cursor() as cur:
                 cur.execute("""
                     SELECT
@@ -489,11 +495,7 @@ def run_pgbouncer_tests(b_host, b_port):
         logger.error(f"  ❌  {lbl} — {str(e).splitlines()[0]}")
         record(lbl, False)
 
-    # read_user should NOT be routable through PgBouncer (not in userlist.txt)
-    # auth_query fallback may or may not work depending on server state;
-    # we check the design intent by confirming read_user is excluded from pooled write path.
     lbl = "pgbouncer: read_user is not a pooled write-path user (design check)"
-    # This is a documentation-level check — we log a note rather than a pass/fail
     logger.info(f"  ℹ️   {lbl}: read_user connects DIRECTLY to replica ports, not via PgBouncer.")
 
 
@@ -523,9 +525,9 @@ def http_check(url, label, expected_status=200, timeout=5):
 def run_monitoring_checks():
     section("8. MONITORING — HTTP health checks")
 
-    exporter_url  = os.getenv("POSTGRES_EXPORTER_URL", "").rstrip("/")
+    exporter_url   = os.getenv("POSTGRES_EXPORTER_URL", "").rstrip("/")
     prometheus_url = os.getenv("PROMETHEUS_URL", "").rstrip("/")
-    grafana_url   = os.getenv("GRAFANA_URL", "").rstrip("/")
+    grafana_url    = os.getenv("GRAFANA_URL", "").rstrip("/")
 
     if exporter_url:
         http_check(f"{exporter_url}/metrics", "postgres-exporter /metrics")
@@ -576,6 +578,13 @@ def main():
     p_host, p_port = parse_address(os.getenv("PRIMARY_DB"))
     b_host, b_port = parse_address(os.getenv("BOUNCER_DB"))
 
+    # DIRECT_PRIMARY_DB bypasses PgBouncer — needed for pg_stat_replication
+    # and for users not in PgBouncer's userlist (read_user).
+    # Falls back to PRIMARY_DB if not set (works when running outside Docker).
+    direct_host, direct_port = parse_address(
+        os.getenv("DIRECT_PRIMARY_DB") or os.getenv("PRIMARY_DB")
+    )
+
     replicas = []
     for i, entry in enumerate(os.getenv("REPLICA_DBS", "").split(","), start=1):
         entry = entry.strip()
@@ -594,10 +603,10 @@ def main():
         exit(1)
 
     run_auth_tests(p_host, p_port, replicas)
-    run_permission_tests(p_host, p_port, replicas)
+    run_permission_tests(p_host, p_port, direct_host, direct_port, replicas)
     run_replication_lifecycle(p_host, p_port, replicas)
     run_replica_write_rejection(replicas)
-    run_replication_status(p_host, p_port, expected_replicas=len(replicas))
+    run_replication_status(direct_host, direct_port, expected_replicas=len(replicas))
 
     if b_host:
         run_pgbouncer_tests(b_host, b_port)
