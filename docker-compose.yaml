@@ -1,0 +1,13 @@
+# docker-compose.yaml
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    networks:
+      - default
+      - pg_network
+
+networks:
+  pg_network:
+    external: true
+    name: pg_network
