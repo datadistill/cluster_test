@@ -1,3 +1,4 @@
 .env
 .venv
 __pycache__/main.cpython-311.pyc
+try.txt
